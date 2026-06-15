@@ -1,22 +1,5 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.12"
-# dependencies = [
-#   "aiohttp>=3.10",
-#   "numpy>=1.24",
-#   "pandas>=2.0.0",
-#   "tiktoken>=0.7",
-#   "transformers>=4.46",
-#   "xlsxwriter>=3.2.1",
-#   "tqdm>=4.66",
-#   "httpx[socks]>=0.28.1",
-#   "socksio>=1.0.0"
-# ]
-# ///
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from __future__ import annotations
-
 import argparse
 import asyncio
 import json
@@ -25,547 +8,32 @@ import multiprocessing as mp
 import os
 import random
 import time
-from abc import ABC, abstractmethod
 from collections import Counter, deque
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
 from statistics import mean
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import aiohttp  # type: ignore
 import numpy as np  # type: ignore
 import pandas as pd  # type: ignore
-from tqdm import tqdm
+from bench_dataset import (
+    ConversationsMap,
+    ConvId,
+    GenConvArgs,
+    MessagesList,
+    ShareGptConversations,
+    conversations_dict_to_list,
+    conversations_list_to_dict,
+    generate_conversations,
+    parse_input_json_file,
+)
+from bench_utils import TEXT_SEPARATOR, Color, logger
 from transformers import AutoTokenizer  # type: ignore
 
 NUM_TOKENS_FROM_DATASET = 0
 TERM_SIGNAL = None
-TEXT_SEPARATOR = "-" * 100
-
-
-def normalize_base_url(url: str) -> str:
-    url = url.strip().rstrip("/")
-    if url.endswith("/v1"):
-        url = url[: -len("/v1")].rstrip("/")
-    return url
-
-
-def parse_extra_body(raw_json: str | None) -> dict[str, Any]:
-    if raw_json is None:
-        return {}
-    parsed = json.loads(raw_json)
-    if not isinstance(parsed, dict):
-        raise ValueError("--extra-body-json must decode to a JSON object.")
-    return parsed
-
-
-def deep_merge_dict(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
-    for key, value in extra.items():
-        existing = merged.get(key)
-        if isinstance(existing, dict) and isinstance(value, dict):
-            merged[key] = deep_merge_dict(existing, value)
-        else:
-            merged[key] = value
-    return merged
-
-
-class Color(Enum):
-    RED = "\033[91m"
-    GREEN = "\033[92m"
-    BLUE = "\033[94m"
-    PURPLE = "\033[95m"
-    CYAN = "\033[96m"
-    YELLOW = "\033[93m"
-    RESET = "\033[0m"
-
-    def __str__(self):
-        return self.value
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] - %(message)s",
-    datefmt="%d-%m-%Y %H:%M:%S",
-)
-logger = logging.getLogger(__name__)
-
-# Conversation ID is a string (e.g: "UzTK34D")
-ConvId = str
-
-# A list of dicts (dicts with keys "id" and "messages")
-ShareGptConversations = list[dict[str, Any]]
-
-# A list of dicts (dicts with keys "role" and "content")
-MessagesList = list[dict[str, str]]
-
-# Map conversation ID to conversation messages
-ConversationsMap = dict[ConvId, MessagesList]
-
-
-class Distribution(ABC):
-    @abstractmethod
-    def sample(self, size: int = 1) -> np.ndarray:
-        pass
-
-
-class UniformDistribution(Distribution):
-    def __init__(
-        self,
-        min_val: int | float,
-        max_val: int | float,
-        is_integer: bool = True,
-    ) -> None:
-        self.min_val = min_val
-        self.max_val = max_val
-        self.is_integer = is_integer
-
-    def sample(self, size: int = 1) -> np.ndarray:
-        if self.is_integer:
-            return np.random.randint(
-                int(self.min_val), int(self.max_val + 1), size=size
-            )
-        return np.random.uniform(self.min_val, self.max_val, size=size)
-
-    def __repr__(self) -> str:
-        return f"UniformDistribution[{self.min_val}, {self.max_val}]"
-
-
-class ConstantDistribution(Distribution):
-    def __init__(self, value: int | float) -> None:
-        self.value = value
-        self.max_val = value
-
-    def sample(self, size: int = 1) -> np.ndarray:
-        return np.full(shape=size, fill_value=self.value)
-
-    def __repr__(self) -> str:
-        return f"Constant[{self.value}]"
-
-
-class ZipfDistribution(Distribution):
-    def __init__(self, alpha: float, max_val: int | None = None) -> None:
-        self.alpha = alpha
-        self.max_val = max_val
-
-    def sample(self, size: int = 1) -> np.ndarray:
-        samples = np.random.zipf(self.alpha, size=size)
-        if self.max_val:
-            samples = np.minimum(samples, self.max_val)
-        return samples
-
-    def __repr__(self) -> str:
-        return f"ZipfDistribution[{self.alpha}]"
-
-
-class PoissonDistribution(Distribution):
-    def __init__(self, alpha: float, max_val: int | None = None) -> None:
-        self.alpha = alpha
-        self.max_val = max_val
-
-    def sample(self, size: int = 1) -> np.ndarray:
-        samples = np.random.poisson(self.alpha, size=size)
-        if self.max_val:
-            samples = np.minimum(samples, self.max_val)
-        return samples
-
-    def __repr__(self) -> str:
-        return f"PoissonDistribution[{self.alpha}]"
-
-
-class LognormalDistribution(Distribution):
-    def __init__(
-        self,
-        mean: float | None = None,
-        sigma: float | None = None,
-        average: int | None = None,
-        median_ratio: float | None = None,
-        max_val: int | None = None,
-    ) -> None:
-        self.average = average
-        self.median_ratio = median_ratio
-        self.max_val = max_val
-
-        if average is not None:
-            if average < 1:
-                raise ValueError("Lognormal average must be positive")
-
-            if mean or sigma:
-                raise ValueError(
-                    "When using lognormal average, you can't provide mean/sigma"
-                )
-
-            if self.median_ratio is None:
-                self.median_ratio = 0.85
-
-            mean, sigma = self._generate_lognormal_by_median(
-                target_average=self.average,
-                median_ratio=self.median_ratio,
-            )
-        else:
-            if mean is None or sigma is None:
-                raise ValueError(
-                    "Must provide both mean and sigma if average is not used"
-                )
-
-            if mean <= 0 or sigma < 0:
-                raise ValueError(
-                    "Lognormal mean must be positive and sigma must be non-negative"
-                )
-
-        self.mean = mean
-        self.sigma = sigma
-
-    @staticmethod
-    def _generate_lognormal_by_median(
-        target_average: int, median_ratio: float
-    ) -> tuple[float, float]:
-        if median_ratio <= 0 or median_ratio >= 1:
-            raise ValueError("median_ratio must be in range (0, 1)")
-
-        target_median = target_average * median_ratio
-        sigma = np.sqrt(2 * np.log(target_average / target_median))
-        mu = np.log(target_median)
-        return mu, sigma
-
-    def sample(self, size: int = 1) -> np.ndarray:
-        samples = np.random.lognormal(mean=self.mean, sigma=self.sigma, size=size)
-
-        if self.average is not None:
-            samples *= self.average / samples.mean()
-
-        if self.max_val:
-            samples = np.minimum(samples, self.max_val)
-
-        return np.round(samples).astype(int)
-
-    def __repr__(self) -> str:
-        if self.average:
-            return (
-                f"LognormalDistribution[{self.average}, "
-                f"{self.median_ratio}, {self.max_val}]"
-            )
-        return f"LognormalDistribution[{self.mean}, {self.sigma}, {self.max_val}]"
-
-
-class GenConvArgs(NamedTuple):
-    num_conversations: int
-    text_files: list[str]
-    input_num_turns: Distribution
-    input_common_prefix_num_tokens: Distribution
-    input_prefix_num_tokens: Distribution
-    input_num_tokens: Distribution
-    output_num_tokens: Distribution
-    print_stats: bool
-
-
-def verify_field_exists(
-    conf: dict, field_name: str, section: str, subsection: str
-) -> None:
-    if field_name not in conf:
-        raise ValueError(
-            f"Missing field '{field_name}' in {section=} and {subsection=}"
-        )
-
-
-def get_random_distribution(
-    conf: dict, section: str, subsection: str, optional: bool = False
-) -> Distribution:
-    conf = conf[section]
-
-    if optional and subsection not in conf:
-        return ConstantDistribution(0)
-
-    if subsection not in conf:
-        raise ValueError(f"Missing subsection {subsection} in section {section}")
-
-    conf = conf[subsection]
-    distribution = conf.get("distribution")
-    if distribution is None:
-        raise ValueError(
-            f"Missing field 'distribution' in {section=} and {subsection=}"
-        )
-
-    if distribution == "constant":
-        verify_field_exists(conf, "value", section, subsection)
-        return ConstantDistribution(conf["value"])
-    if distribution == "zipf":
-        verify_field_exists(conf, "alpha", section, subsection)
-        return ZipfDistribution(conf["alpha"], max_val=conf.get("max", None))
-    if distribution == "poisson":
-        verify_field_exists(conf, "alpha", section, subsection)
-        return PoissonDistribution(conf["alpha"], max_val=conf.get("max", None))
-    if distribution == "lognormal":
-        max_val = conf.get("max", None)
-        if "average" in conf:
-            return LognormalDistribution(
-                average=conf["average"],
-                median_ratio=conf.get("median_ratio", None),
-                max_val=max_val,
-            )
-
-        verify_field_exists(conf, "mean", section, subsection)
-        verify_field_exists(conf, "sigma", section, subsection)
-        return LognormalDistribution(
-            mean=conf["mean"], sigma=conf["sigma"], max_val=max_val
-        )
-    if distribution == "uniform":
-        verify_field_exists(conf, "min", section, subsection)
-        verify_field_exists(conf, "max", section, subsection)
-
-        min_value = conf["min"]
-        max_value = conf["max"]
-        assert min_value > 0
-        assert min_value <= max_value
-
-        is_integer = isinstance(min_value, int) and isinstance(max_value, int)
-        return UniformDistribution(min_value, max_value, is_integer)
-
-    raise ValueError(f"Unknown distribution: {distribution}")
-
-
-def parse_input_json_file(conf: dict) -> GenConvArgs:
-    assert isinstance(conf, dict)
-    required_fields = [
-        "filetype",
-        "num_conversations",
-        "text_files",
-        "prompt_input",
-        "prompt_output",
-    ]
-    for field in required_fields:
-        assert field in conf, f"Missing field {field} in input {conf}"
-
-    assert conf["filetype"] == "generate_conversations"
-    assert conf["num_conversations"] > 0, "num_conversations should be larger than zero"
-
-    text_files = conf["text_files"]
-    assert isinstance(text_files, list), "Field 'text_files' should be a list"
-    assert len(text_files) > 0, (
-        "Field 'text_files' should be a list with at least one file"
-    )
-
-    print_stats: bool = conf.get("print_stats", False)
-    assert isinstance(print_stats, bool), (
-        "Field 'print_stats' should be either 'true' or 'false'"
-    )
-
-    return GenConvArgs(
-        num_conversations=conf["num_conversations"],
-        text_files=text_files,
-        input_num_turns=get_random_distribution(conf, "prompt_input", "num_turns"),
-        input_common_prefix_num_tokens=get_random_distribution(
-            conf, "prompt_input", "common_prefix_num_tokens", optional=True
-        ),
-        input_prefix_num_tokens=get_random_distribution(
-            conf, "prompt_input", "prefix_num_tokens"
-        ),
-        input_num_tokens=get_random_distribution(conf, "prompt_input", "num_tokens"),
-        output_num_tokens=get_random_distribution(conf, "prompt_output", "num_tokens"),
-        print_stats=print_stats,
-    )
-
-
-def print_conv_stats(conversations: ConversationsMap, tokenizer: AutoTokenizer) -> None:
-    conv_stats: list[dict[Any, Any]] = []
-    req_stats: list[int] = []
-
-    print("\nCollecting statistics...")
-    for messages in conversations.values():
-        user_tokens: list[int] = []
-        assistant_tokens: list[int] = []
-        request_tokens: list[int] = []
-        req_tokens = 0
-
-        for message in messages:
-            content = message["content"]
-            num_tokens = len(tokenizer(content).input_ids)
-
-            if message["role"] == "user":
-                user_tokens.append(num_tokens)
-                req_tokens += num_tokens
-                request_tokens.append(req_tokens)
-            elif message["role"] == "assistant":
-                assistant_tokens.append(num_tokens)
-                req_tokens += num_tokens
-
-        conv_stats.append(
-            {
-                "conversation_turns": len(messages),
-                "user_tokens": mean(user_tokens),
-                "assistant_tokens": mean(assistant_tokens),
-            }
-        )
-        req_stats.extend(request_tokens)
-
-    percentiles = [0.25, 0.5, 0.75, 0.9, 0.99]
-
-    print(TEXT_SEPARATOR)
-    print(f"{Color.YELLOW}Conversations statistics:{Color.RESET}")
-    print(TEXT_SEPARATOR)
-    print(pd.DataFrame(conv_stats).describe(percentiles=percentiles).transpose())
-    print(TEXT_SEPARATOR)
-    print(f"{Color.YELLOW}Request statistics:{Color.RESET}")
-    print(TEXT_SEPARATOR)
-    print(
-        pd.DataFrame(req_stats, columns=["request_tokens"]).describe(
-            percentiles=percentiles
-        ).transpose()
-    )
-    print(TEXT_SEPARATOR)
-
-
-def generate_conversations(
-    args: GenConvArgs, tokenizer: AutoTokenizer
-) -> ConversationsMap:
-    base_prompt_text = "Please rewrite the following text and add more content: "
-    base_prompt_token_count = len(
-        tokenizer.encode(base_prompt_text, add_special_tokens=False)
-    )
-
-    logger.info(f"{Color.PURPLE}Generating conversations...{Color.RESET}")
-    logger.info(args)
-
-    list_of_tokens = []
-    for filename in args.text_files:
-        with open(filename) as file:
-            data = file.read()
-            tokens_in_file = tokenizer.encode(data, add_special_tokens=False)
-            list_of_tokens.extend(tokens_in_file)
-        logger.info(
-            f"Loaded {len(tokens_in_file)} tokens from file {filename}, "
-            f"total tokens so far: {len(list_of_tokens)}"
-        )
-
-    conversations: ConversationsMap = {}
-    turn_count: np.ndarray = args.input_num_turns.sample(args.num_conversations)
-    turn_count = np.maximum(turn_count, 2)
-    turn_count = turn_count + (turn_count % 2)
-    conv_prefix_tokens: np.ndarray = args.input_prefix_num_tokens.sample(
-        args.num_conversations
-    )
-
-    base_offset = 0
-    common_prefix_text = ""
-    common_prefix_tokens: int = args.input_common_prefix_num_tokens.sample(1)[0]
-    if common_prefix_tokens > 0:
-        common_prefix_text = (
-            tokenizer.decode(list_of_tokens[: common_prefix_tokens - 2]) + "."
-        )
-        base_offset += common_prefix_tokens
-
-    for conv_id in tqdm(
-        range(args.num_conversations),
-        total=args.num_conversations,
-        desc="Generating conversations",
-        unit="conv",
-    ):
-        messages: MessagesList = []
-        nturns = turn_count[conv_id]
-        input_token_count: np.ndarray = args.input_num_tokens.sample(nturns).astype(int)
-        input_token_count = np.maximum(input_token_count, base_prompt_token_count)
-
-        output_token_count: np.ndarray = args.output_num_tokens.sample(nturns).astype(
-            int
-        )
-        output_token_count = np.maximum(output_token_count, 1)
-
-        user_turn = True
-        for turn_id in range(nturns):
-            if user_turn:
-                role = "user"
-                num_tokens = input_token_count[turn_id]
-                content = f"{conv_id} is a nice number... "
-
-                if common_prefix_text and turn_id == 0:
-                    content = common_prefix_text + content
-
-                num_tokens -= len(tokenizer.encode(content, add_special_tokens=False))
-
-                if turn_id == 0:
-                    prefix_num_tokens = conv_prefix_tokens[conv_id]
-                    if prefix_num_tokens > 0:
-                        start_offset = base_offset
-                        end_offset = start_offset + prefix_num_tokens
-                        assert len(list_of_tokens) > end_offset, (
-                            "Not enough input text to generate "
-                            f"{prefix_num_tokens} tokens for the "
-                            f"prefix text ({start_offset=}, {end_offset=})"
-                        )
-
-                        content += f"{conv_id}, " + tokenizer.decode(
-                            list_of_tokens[start_offset:end_offset]
-                        )
-                        base_offset += prefix_num_tokens
-
-                content += base_prompt_text
-                num_tokens -= base_prompt_token_count
-
-                if num_tokens > 0:
-                    start_offset = base_offset + turn_id * input_token_count.max()
-                    end_offset = start_offset + num_tokens
-                    assert len(list_of_tokens) > end_offset, (
-                        f"Not enough input text to generate {num_tokens} tokens "
-                        f"for the prompt ({start_offset=}, {end_offset=})"
-                    )
-                    content += tokenizer.decode(list_of_tokens[start_offset:end_offset])
-            else:
-                role = "assistant"
-                num_tokens = output_token_count[turn_id]
-                assert len(list_of_tokens) > num_tokens, (
-                    f"Not enough input text to generate {num_tokens} "
-                    "tokens for assistant content"
-                )
-                content = tokenizer.decode(list_of_tokens[:num_tokens])
-
-            messages.append({"role": role, "content": content})
-            user_turn = not user_turn
-
-        conversations[f"CONV_ID_{conv_id}"] = messages
-        base_offset += nturns
-
-    if args.print_stats:
-        print_conv_stats(conversations, tokenizer)
-
-    return conversations
-
-
-def conversations_list_to_dict(input_list: ShareGptConversations) -> ConversationsMap:
-    conversations: ConversationsMap = {}
-    for item in input_list:
-        conv_id: str = item["id"]
-        assert isinstance(conv_id, str)
-        assert conv_id not in conversations, (
-            f"Conversation ID {conv_id} found more than once in the input"
-        )
-
-        messages: MessagesList = item["messages"]
-        assert isinstance(messages, list), (
-            f"Conversation messages should be a list (ID: {conv_id})"
-        )
-        assert len(messages) > 0, f"Conversation with no messages (ID: {conv_id})"
-
-        conversations[conv_id] = messages
-
-    logger.info(f"Using {len(conversations)} unique conversations (IDs)")
-    assert len(conversations) == len(input_list)
-
-    stats: list[dict[str, Any]] = [{"num_turns": len(conv)} for conv in conversations.values()]
-    print(TEXT_SEPARATOR)
-    print(f"{Color.YELLOW}Conversations statistics:{Color.RESET}")
-    print(TEXT_SEPARATOR)
-    percentiles = [0.25, 0.5, 0.75, 0.9, 0.99, 0.999, 0.9999]
-    print(pd.DataFrame(stats).describe(percentiles=percentiles).transpose())
-    print(TEXT_SEPARATOR)
-    return conversations
-
-
-def conversations_dict_to_list(input_dict: ConversationsMap) -> ShareGptConversations:
-    output: ShareGptConversations = []
-    for conv_id, conv_data in input_dict.items():
-        output.append({"id": conv_id, "messages": conv_data})
-    return output
 
 
 class ConversationSampling(str, Enum):
@@ -597,7 +65,32 @@ class RequestArgs(NamedTuple):
     limit_min_tokens: int  # Use negative value for no limit
     limit_max_tokens: int  # Use negative value for no limit
     timeout_sec: int
-    extra_body: dict[str, Any]
+    send_conversation_id: bool
+    headers: dict[str, str]
+
+
+def parse_custom_header(header: str) -> tuple[str, str]:
+    separators = (":", "=")
+    for separator in separators:
+        if separator in header:
+            key, value = header.split(separator, 1)
+            key = key.strip()
+            value = value.strip()
+            if key:
+                return key, value
+            break
+    raise argparse.ArgumentTypeError(
+        "Headers must be provided as 'Header-Name: value' or 'Header-Name=value'"
+    )
+
+
+def build_request_headers(
+    api_key: str | None, custom_headers: list[tuple[str, str]] | None
+) -> dict[str, str]:
+    headers = dict(custom_headers or [])
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 class BenchmarkArgs(NamedTuple):
@@ -750,34 +243,32 @@ async def send_request(
     min_tokens: int | None = None,
     max_tokens: int | None = None,
     timeout_sec: int = 120,
-    extra_body: dict[str, Any] | None = None,
+    conversation_id: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> ServerResponse:
     payload = {
         "model": model,
         "messages": messages,
-        "seed": 0,
-        "temperature": 0.0,
     }
+
+    if conversation_id is not None:
+        payload["conversation_id"] = conversation_id
 
     if stream:
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": False}
 
-    if min_tokens is not None:
-        payload["min_tokens"] = min_tokens
+    # if min_tokens is not None:
+    #     payload["min_tokens"] = min_tokens
 
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
 
-    if extra_body:
-        payload = deep_merge_dict(payload, extra_body)
-
-    headers = {"Content-Type": "application/json"}
-
-    # Add Authorization header if API key is provided
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    request_headers = {"Content-Type": "application/json"}
+    if conversation_id is not None:
+        request_headers["X-Session-ID"] = str(conversation_id)
+    if headers is not None:
+        request_headers.update(headers)
 
     # Calculate the timeout for the request
     if max_tokens is not None:
@@ -799,22 +290,11 @@ async def send_request(
     first_chunk = ""
     generated_text = ""
 
-    def extract_stream_fragment(delta: Any) -> str | None:
-        if not isinstance(delta, dict):
-            return None
-        # OpenAI-compatible servers generally stream tokens under `delta.content`,
-        # but some models/providers use other fields (e.g. reasoning_content).
-        for key in ("content", "reasoning_content", "text"):
-            value = delta.get(key)
-            if isinstance(value, str) and value:
-                return value
-        return None
-
     start_time: int = time.perf_counter_ns()
     most_recent_timestamp: int = start_time
 
     async with session.post(
-        url=chat_url, json=payload, headers=headers, timeout=timeout
+        url=chat_url, json=payload, headers=request_headers, timeout=timeout
     ) as response:
         http_status = HTTPStatus(response.status)
         if http_status == HTTPStatus.OK:
@@ -837,20 +317,18 @@ async def send_request(
                     data = json.loads(chunk)
 
                     # Delta is the new content/text/data
-                    choice0 = data["choices"][0]
-                    delta = choice0.get("delta", {})
-                    fragment = extract_stream_fragment(delta)
-                    if fragment is not None:
+                    delta = data["choices"][0]["delta"]
+                    if delta.get("content", None):
                         if ttft is None:
                             # First token
                             first_token_time = time.perf_counter_ns()
                             ttft = first_token_time - start_time
-                            first_chunk = fragment
+                            first_chunk = delta["content"]
                         else:
                             # Decoding phase
                             chunk_delay.append(timestamp - most_recent_timestamp)
 
-                        generated_text += fragment
+                        generated_text += delta["content"]
 
                     most_recent_timestamp = timestamp
         else:
@@ -868,6 +346,8 @@ async def send_request(
             latency = time.perf_counter_ns() - start_time
 
     if ttft is None:
+        if stream:
+            valid_response = False
         # The response was a single chunk
         ttft = latency
 
@@ -974,7 +454,8 @@ async def send_turn(
         min_tokens,
         max_tokens,
         req_args.timeout_sec,
-        req_args.extra_body,
+        conversation_id=conv_id if req_args.send_conversation_id else None,
+        headers=req_args.headers,
     )
 
     if response.valid is False:
@@ -1421,11 +902,9 @@ def get_client_config(
         raise ValueError("Request timeout must be a positive number")
 
     # Arguments for API requests
-    base_url = normalize_base_url(args.url)
-    chat_url = f"{base_url}/v1/chat/completions"
+    chat_url = f"{args.url}/v1/chat/completions"
     model_name = args.served_model_name if args.served_model_name else args.model
-
-    extra_body = parse_extra_body(args.extra_body_json)
+    headers = build_request_headers(args.api_key, args.header)
 
     req_args = RequestArgs(
         chat_url=chat_url,
@@ -1434,7 +913,8 @@ def get_client_config(
         limit_min_tokens=args.limit_min_tokens,
         limit_max_tokens=args.limit_max_tokens,
         timeout_sec=args.request_timeout_sec,
-        extra_body=extra_body,
+        send_conversation_id=args.send_conversation_id,
+        headers=headers,
     )
 
     return client_args, req_args
@@ -1636,7 +1116,6 @@ def process_statistics(
     verbose: bool,
     gen_conv_args: GenConvArgs | None = None,
     excel_output: bool = False,
-    csv_output: str | None = "result.csv",
     warmup_runtime_sec: float | None = None,
 ) -> None:
     if len(client_metrics) == 0:
@@ -1662,10 +1141,6 @@ def process_statistics(
     # Final raw data should be sorted by time
     raw_data = raw_data.sort_values(by=["start_time_ms"])
     raw_data["end_time_ms"] = raw_data["start_time_ms"] + raw_data["latency_ms"]
-
-    if csv_output:
-        raw_data.to_csv(csv_output, index=False)
-        logger.info(f"{Color.GREEN}Wrote CSV results: {csv_output}{Color.RESET}")
 
     percentiles = [0.25, 0.5, 0.75, 0.9]
 
@@ -1805,20 +1280,19 @@ def process_statistics(
         )
 
 
-async def get_server_info(url: str) -> None:
-    url = normalize_base_url(url)
+async def get_server_info(url: str, headers: dict[str, str] | None = None) -> None:
     logger.info(f"{Color.BLUE}Collecting information from server: {url}{Color.RESET}")
     async with aiohttp.ClientSession() as session:
         # Get server version (not mandatory, "version" endpoint may not exist)
         url_version = f"{url}/version"
-        async with session.get(url_version) as response:
+        async with session.get(url_version, headers=headers) as response:
             if HTTPStatus(response.status) == HTTPStatus.OK:
                 text = await response.text()
                 logger.info(f"{Color.BLUE}Server version: {text}{Color.RESET}")
 
         # Get available models
         url_models = f"{url}/v1/models"
-        async with session.get(url_models) as response:
+        async with session.get(url_models, headers=headers) as response:
             if HTTPStatus(response.status) == HTTPStatus.OK:
                 text = await response.text()
                 logger.info(f"{Color.BLUE}Models:{Color.RESET}")
@@ -1854,15 +1328,7 @@ async def main() -> None:
         "--output-file",
         type=str,
         default=None,
-        help="Output JSON file containing conversations with updated assistant answers. "
-        "If not set, no JSON file is written.",
-    )
-
-    parser.add_argument(
-        "--csv-output",
-        type=str,
-        default="result.csv",
-        help="Write per-request metrics to a CSV file (default: result.csv).",
+        help="Output JSON file containing conversations with updated assistant answers",
     )
 
     parser.add_argument(
@@ -1889,16 +1355,23 @@ async def main() -> None:
         "--url",
         type=str,
         default="http://localhost:8000",
-        help="Base URL for the LLM API server. Accepts either http://host:port "
-        "or http://host:port/v1 (both will work).",
+        help="Base URL for the LLM API server",
     )
 
     parser.add_argument(
-        "--trust-remote-code",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Whether to pass trust_remote_code=True when loading tokenizer from HuggingFace "
-        "(default: enabled).",
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key to send as an Authorization bearer token",
+    )
+    parser.add_argument(
+        "--header",
+        action="append",
+        type=parse_custom_header,
+        default=None,
+        metavar="KEY=VALUE",
+        help="Custom request header. Can be specified multiple times. "
+        "Accepts 'Header-Name: value' or 'Header-Name=value'.",
     )
 
     parser.add_argument(
@@ -2016,11 +1489,33 @@ async def main() -> None:
     )
 
     parser.add_argument(
+        "--send-conversation-id",
+        default=False,
+        action="store_true",
+        help=(
+            "Inject a `conversation_id` field into each Chat Completions "
+            "payload. This is a non-standard OpenAI extension consumed by "
+            "vLLM's disaggregated multi-turn proxy "
+            "(examples/disaggregated/disaggregated_serving/"
+            "disagg_proxy_multiturn.py) to key cross-turn KV cache reuse. "
+            "Leave disabled (default) when targeting strict "
+            "OpenAI-compatible endpoints; enable when benchmarking the "
+            "disaggregated proxy."
+        ),
+    )
+
+    parser.add_argument(
         "-e",
         "--excel-output",
         default=False,
         action="store_true",
         help="Export summary to Excel file (optional)",
+    )
+    parser.add_argument(
+        "--stats-json-output",
+        type=str,
+        default=None,
+        help="Export per-request stats (ttft_ms, tpot_ms, etc.) to a JSON file",
     )
     parser.add_argument(
         "-v",
@@ -2035,11 +1530,6 @@ async def main() -> None:
         action="store_true",
         help="Print the user prompts and the server's answers",
     )
-    parser.add_argument(
-        "--extra-body-json",
-        default=None,
-        help="JSON object merged into each chat completions request body.",
-    )
 
     parser.add_argument(
         "--warmup-percentages",
@@ -2050,15 +1540,13 @@ async def main() -> None:
         "(for example: --warmup-percentages=0%%,50%%)",
     )
 
-    args = parser.parse_args()
-    extra_body = parse_extra_body(args.extra_body_json)
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code when loading the tokenizer.",
+    )
 
-    original_url = args.url
-    args.url = normalize_base_url(args.url)
-    if args.url != original_url:
-        logger.info(
-            f"{Color.BLUE}Normalized --url from {original_url!r} to {args.url!r}{Color.RESET}"
-        )
+    args = parser.parse_args()
 
     logger.info(args)
 
@@ -2066,8 +1554,6 @@ async def main() -> None:
     logger.info(f"url={args.url}")
     logger.info(f"model={args.model}")
     logger.info(f"num_clients={args.num_clients}")
-    if extra_body:
-        logger.info("extra_body=%s", extra_body)
 
     if args.verify_output:
         logger.info(f"{Color.PURPLE}Verify is enabled{Color.RESET}")
@@ -2094,7 +1580,7 @@ async def main() -> None:
 
     except Exception:
         raise ValueError(
-            f"Invalid --warmup-percentages={args.warmup_percentages}"
+            f"Invalid --warmup-percentage={args.warmup_percentage}"
         ) from None
 
     # Set global seeds for main process
@@ -2102,16 +1588,12 @@ async def main() -> None:
     np.random.seed(args.seed)
 
     logger.info("Loading tokenizer")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.model, trust_remote_code=args.trust_remote_code
-        )
-    except Exception as e:
-        logger.warning(f"Failed to load tokenizer for {args.model}: {e}")
-        logger.info("Falling back to gpt2 tokenizer")
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, trust_remote_code=args.trust_remote_code
+    )
 
-    await get_server_info(args.url)
+    headers = build_request_headers(args.api_key, args.header)
+    await get_server_info(args.url, headers=headers)
 
     # Load the input file (either conversations of configuration file)
     logger.info(f"Reading input file: {args.input_file}")
@@ -2253,9 +1735,21 @@ async def main() -> None:
         verbose=args.verbose,
         gen_conv_args=gen_conv_args,
         excel_output=args.excel_output,
-        csv_output=args.csv_output,
         warmup_runtime_sec=warmup_runtime_sec,
     )
+
+    if args.stats_json_output is not None:
+        # Export per-request metrics as a JSON array for downstream analysis.
+        stats_data = [s._asdict() for s in client_metrics]
+        logger.info(
+            f"{Color.GREEN}Writing per-request stats JSON: "
+            f"{args.stats_json_output}{Color.RESET}"
+        )
+        os.makedirs(
+            os.path.dirname(os.path.abspath(args.stats_json_output)), exist_ok=True
+        )
+        with open(args.stats_json_output, "w") as f:
+            json.dump(stats_data, f, indent=2)
 
     if args.output_file is not None:
         # Write a JSON file with the updated conversations

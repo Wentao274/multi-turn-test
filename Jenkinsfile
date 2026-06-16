@@ -154,6 +154,7 @@ docker exec ${containerName} bash -c \\
         --num-clients ${params.NUM_CLIENTS} \\
         --max-active-conversations ${params.MAX_ACTIVE_CONVERSATIONS} \\
         ${params.STREAM_MODE == 'false' ? '--no-stream' : ''} \\
+        --warmup-step \\
         --trust-remote-code" 2>&1 | tee ${logFile}
 echo "=== 测试执行完成 ==="
 echo "输出文件: ${outputFile}"

@@ -291,16 +291,16 @@ find ./${buildsDir} -name '*.log' | wc -l
     <table>
         <tr><th>项目</th><td>值</td></tr>
         <tr><td>构建编号</td><td>#${BUILD_NUMBER}</td></tr>
+        <tr><td>测试人员</td><td>${params.TESTER}</td></tr>
         <tr><td>芯片平台</td><td>${params.CHIP}</td></tr>
         <tr><td>推理框架</td><td>${params.INFRA}</td></tr>
-        <tr><td>PD模式</td><td>${params.PD}</td></tr>
         <tr><td>模型名称</td><td>${params.MODEL}</td></tr>
         <tr><td>模型路径</td><td>${params.MODEL_PATH}</td></tr>
         <tr><td>API 地址</td><td>${params.BASE_URL}</td></tr>
+        <tr><td>PD模式</td><td>${params.PD}</td></tr>
         <tr><td>并发客户端数</td><td>${params.NUM_CLIENTS}</td></tr>
         <tr><td>最大活跃对话数</td><td>${params.MAX_ACTIVE_CONVERSATIONS}</td></tr>
         <tr><td>输入配置文件</td><td>${params.INPUT_FILE}</td></tr>
-        <tr><td>测试人员</td><td>${params.TESTER}</td></tr>
         <tr><td>测试日期</td><td>${curDateTime}</td></tr>
         <tr><td>执行时间</td><td>${currentBuild.durationString}</td></tr>
         <tr><td>测试状态</td><td>${testStatus}</td></tr>

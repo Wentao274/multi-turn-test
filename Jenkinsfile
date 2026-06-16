@@ -11,6 +11,7 @@ pipeline {
         string(name: 'NUM_CLIENTS', defaultValue: '10', description: '并发客户端数量')
         string(name: 'MAX_ACTIVE_CONVERSATIONS', defaultValue: '30', description: '最大活跃对话数')
         string(name: 'INPUT_FILE', defaultValue: 'generate_multi_turn.json', description: '输入配置文件名')
+        choice(name: 'STREAM_MODE', choices: ['true', 'false'], description: '是否使用流式模式，sglang建议选false')
         text(name: 'RECIPIENTS', defaultValue: 'liwt@zetyun.com', description: '邮件接收者（逗号分隔）')
         string(name: 'WORK_DIR', defaultValue: '/dingofs/data1/userdata/liwt/maas-image/multi-turn-test', description: '测试仓库目录，请不要修改')
     }
@@ -128,7 +129,19 @@ if [ "\${HTTP_CODE}" != "200" ]; then
     echo "ERROR: API 连通性检查失败, HTTP状态码: \${HTTP_CODE}, URL: ${params.BASE_URL}/v1/models"
     exit 1
 fi
-echo "API 连通性检查通过, HTTP状态码: \${HTTP_CODE}"
+echo "API /v1/models 连通性检查通过, HTTP状态码: \${HTTP_CODE}"
+
+echo "=== 检查 Chat Completions 接口 ==="
+CHAT_RESP=\$(curl -s -w "\\n%{http_code}" ${params.BASE_URL}/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"${params.MODEL}","messages":[{"role":"user","content":"hello"}],"max_tokens":10}')
+CHAT_HTTP_CODE=\$(echo "\${CHAT_RESP}" | tail -1)
+if [ "\${CHAT_HTTP_CODE}" != "200" ]; then
+    echo "ERROR: Chat Completions 接口检查失败, HTTP状态码: \${CHAT_HTTP_CODE}"
+    echo "响应内容: \$(echo "\${CHAT_RESP}" | head -n -1)"
+    exit 1
+fi
+echo "Chat Completions 接口检查通过, HTTP状态码: \${CHAT_HTTP_CODE}"
 
 docker exec ${containerName} bash -c \\
     "cd /workspace/multi-turn-test && \\
@@ -140,6 +153,7 @@ docker exec ${containerName} bash -c \\
         --output-file ${outputFile} \\
         --num-clients ${params.NUM_CLIENTS} \\
         --max-active-conversations ${params.MAX_ACTIVE_CONVERSATIONS} \\
+        ${params.STREAM_MODE == 'false' ? '--no-stream' : ''} \\
         --trust-remote-code" 2>&1 | tee ${logFile}
 echo "=== 测试执行完成 ==="
 echo "输出文件: ${outputFile}"
@@ -278,6 +292,8 @@ find ./${buildsDir} -name '*.log' | wc -l
         <tr><th>项目</th><td>值</td></tr>
         <tr><td>构建编号</td><td>#${BUILD_NUMBER}</td></tr>
         <tr><td>芯片平台</td><td>${params.CHIP}</td></tr>
+        <tr><td>推理框架</td><td>${params.INFRA}</td></tr>
+        <tr><td>PD模式</td><td>${params.PD}</td></tr>
         <tr><td>模型名称</td><td>${params.MODEL}</td></tr>
         <tr><td>模型路径</td><td>${params.MODEL_PATH}</td></tr>
         <tr><td>API 地址</td><td>${params.BASE_URL}</td></tr>

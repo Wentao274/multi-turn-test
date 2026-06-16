@@ -208,15 +208,14 @@ find ./${buildsDir} -name '*.log' | wc -l
                         def testStatus = "成功"
                         
                         def logFiles = findFiles(glob: "${buildsDir}/**/*.log")
-                        def statsFiles = findFiles(glob: "${buildsDir}/**/stats.json")
-                        def outputFiles = findFiles(glob: "${buildsDir}/**/output.json")
                         
                         def parametersSection = ""
                         def statisticsSummary = ""
                         
                         if (logFiles && logFiles.length > 0) {
                             def logContent = readFile(logFiles[0].path)
-                            def lines = logContent.split('\n')
+                            def cleanContent = logContent.replaceAll(/\x1b\[[0-9;]*m/, '')
+                            def lines = cleanContent.split('\n')
                             def inParameters = false
                             def inSummary = false
                             def parametersLines = []
@@ -224,6 +223,9 @@ find ./${buildsDir} -name '*.log' | wc -l
                             def paramStarted = false
                             def summaryStarted = false
                             def paramHeaderFound = false
+                            
+                            println("DEBUG: 日志文件行数: \${lines.length}")
+                            println("DEBUG: 清理后前5行: \${lines.take(5).join('\n')}")
                             
                             for (def line : lines) {
                                 if (line.contains("Parameters:")) {
@@ -254,6 +256,9 @@ find ./${buildsDir} -name '*.log' | wc -l
                                 }
                             }
                             
+                            println("DEBUG: 解析到的Parameters行数: \${parametersLines.size()}")
+                            println("DEBUG: 解析到的Statistics行数: \${summaryLines.size()}")
+                            
                             parametersSection = parametersLines.join('\n')
                             statisticsSummary = summaryLines.join('\n')
                         }
@@ -261,6 +266,8 @@ find ./${buildsDir} -name '*.log' | wc -l
                         if (!statisticsSummary || statisticsSummary.trim().isEmpty()) {
                             statisticsSummary = "无统计数据"
                             testStatus = "失败/无结果"
+                        } else {
+                            testStatus = "成功"
                         }
                         if (!parametersSection || parametersSection.trim().isEmpty()) {
                             parametersSection = "无参数信息"
@@ -325,13 +332,12 @@ find ./${buildsDir} -name '*.log' | wc -l
 
                         println("=== 发送邮件 ===")
                         println("日志文件: ${logFiles ? logFiles.length : 0}")
-                        println("统计文件: ${statsFiles ? statsFiles.length : 0}")
                         println("测试状态: ${testStatus}")
 
-                        def attachmentPattern = "builds/${BUILD_NUMBER}/**/*.log,builds/${BUILD_NUMBER}/**/stats.json,builds/${BUILD_NUMBER}/**/output.json"
+                        def attachmentPattern = "builds/${BUILD_NUMBER}/**/*.log"
                         
                         emailext(
-                            subject: "[Multi-Turn 测试报告] #${BUILD_NUMBER} ${params.CHIP} - ${params.MODEL}",
+                            subject: "[模型推理 - Multi-Turn 测试报告] #${BUILD_NUMBER} ${params.CHIP} - ${params.MODEL}",
                             body: emailBody,
                             to: "${params.RECIPIENTS}",
                             mimeType: 'text/html',

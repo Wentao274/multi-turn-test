@@ -3,11 +3,13 @@ pipeline {
     parameters {
         string(name: 'TESTER', defaultValue: 'liwt', description: '测试人员名称')
         string(name: 'CHIP', defaultValue: 'nvidia-h100', description: '芯片平台名称')
+        choice(name: 'INFRA', choices: ['vllm', 'sglang'], description: '推理框架')
+        choice(name: 'PD', choices: ['agg', 'disagg'], description: 'PD分离模式,agg 表示非 PD 分离, disagg 表示 PD 分离')
         string(name: 'MODEL', defaultValue: 'kimi-k2.5', description: '模型名称（served-model-name）')
         string(name: 'MODEL_PATH', defaultValue: '/dingofs/data1/userdata/llms/moonshotai/Kimi-K2.6', description: '模型文件本地路径')
-        string(name: 'BASE_URL', defaultValue: 'http://10.201.149.10:8080', description: 'API 地址，注意没有/v1后缀')
-        string(name: 'NUM_CLIENTS', defaultValue: '50', description: '并发客户端数量')
-        string(name: 'MAX_ACTIVE_CONVERSATIONS', defaultValue: '100', description: '最大活跃对话数')
+        string(name: 'BASE_URL', defaultValue: 'http://10.201.149.10:8080', description: 'API 地址')
+        string(name: 'NUM_CLIENTS', defaultValue: '10', description: '并发客户端数量')
+        string(name: 'MAX_ACTIVE_CONVERSATIONS', defaultValue: '30', description: '最大活跃对话数')
         string(name: 'INPUT_FILE', defaultValue: 'generate_multi_turn.json', description: '输入配置文件名')
         text(name: 'RECIPIENTS', defaultValue: 'liwt@zetyun.com', description: '邮件接收者（逗号分隔）')
         string(name: 'WORK_DIR', defaultValue: '/dingofs/data1/userdata/liwt/maas-image/multi-turn-test', description: '测试仓库目录，请不要修改')
@@ -57,10 +59,10 @@ ENDSSH
             steps {
                 script {
                     def containerName = "multi-turn-test-${params.CHIP}-${params.MODEL}-${BUILD_NUMBER}"
-                    def curDate = new Date().format('yyyy-MM-dd')
-                    def reportsDir = "${env.REPORTS_DIR}/${params.TESTER}/${BUILD_NUMBER}/${params.CHIP}/${params.MODEL}/${curDate}"
+                    def curDateTime = new Date().format('yyyyMMddHHmmss')
+                    def reportsDir = "${env.REPORTS_DIR}/${params.TESTER}/${BUILD_NUMBER}/${params.CHIP}/${params.MODEL}/${curDateTime}"
                     env.CONTAINER_NAME = containerName
-                    env.CUR_DATE = curDate
+                    env.CUR_DATE_TIME = curDateTime
                     env.REPORTS_DIR_PATH = reportsDir
 
                     println("=== 启动 vLLM 容器 ===")
@@ -113,7 +115,7 @@ ENDSSH
                             
                             def outputFile = "${reportsDir}/output.json"
                             def statsFile = "${reportsDir}/stats.json"
-                            def logFile = "${reportsDir}/test.log"
+                            def logFile = "${reportsDir}/test_${BUILD_NUMBER}.log"
 
                             sh """
 ssh -o StrictHostKeyChecking=no ${REMOTE_USER}@${REMOTE_HOST} << 'ENDSSH'
@@ -124,13 +126,13 @@ docker exec ${containerName} bash -c \\
     \${PYTHON_CMD} benchmark_serving_multi_turn.py \\
         --model ${params.MODEL_PATH} \\
         --served-model-name ${params.MODEL} \\
-        --url '${params.BASE_URL}/v1' \\
+        --url '${params.BASE_URL}' \\
         --input-file ${params.INPUT_FILE} \\
+        --output-file ${outputFile} \\
         --num-clients ${params.NUM_CLIENTS} \\
         --max-active-conversations ${params.MAX_ACTIVE_CONVERSATIONS} \\
-        --output-file ${outputFile} \\
-        --stats-json-output ${statsFile} \\
-        --seed ${BUILD_NUMBER}" 2>&1 | tee ${logFile}
+        --warmup-step \\
+        --trust-remote-code" 2>&1 | tee ${logFile}
 echo "=== 测试执行完成 ==="
 echo "输出文件: ${outputFile}"
 echo "统计文件: ${statsFile}"
@@ -148,7 +150,7 @@ ENDSSH
                 sshagent(credentials: ["${SSH_CREDENTIALS}"]) {
                     catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                         script {
-                            def curDate = env.CUR_DATE
+                            def curDateTime = env.CUR_DATE_TIME
                             def buildsDir = "builds/${BUILD_NUMBER}"
                             
                             println("=== 拉取测试结果到 Jenkins workspace ===")
@@ -179,7 +181,7 @@ find ./${buildsDir} -name '*.log' | wc -l
                 catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                     script {
                         def buildsDir = "builds/${BUILD_NUMBER}"
-                        def curDate = env.CUR_DATE
+                        def curDateTime = env.CUR_DATE_TIME
                         def testStatus = "成功"
                         
                         def logFiles = findFiles(glob: "${buildsDir}/**/*.log")
@@ -260,7 +262,7 @@ find ./${buildsDir} -name '*.log' | wc -l
 <body>
 <div class="container">
 <div class="header">
-    <h2 style="margin: 0;">Multi-Turn 对话测试报告 - 构建 #${BUILD_NUMBER}</h2>
+    <h2 style="margin: 0;">模型推理 - Multi-Turn 对话测试报告 - 构建 #${BUILD_NUMBER}</h2>
 </div>
 <div class="content">
     <h3>测试概要</h3>
@@ -275,7 +277,7 @@ find ./${buildsDir} -name '*.log' | wc -l
         <tr><td>最大活跃对话数</td><td>${params.MAX_ACTIVE_CONVERSATIONS}</td></tr>
         <tr><td>输入配置文件</td><td>${params.INPUT_FILE}</td></tr>
         <tr><td>测试人员</td><td>${params.TESTER}</td></tr>
-        <tr><td>测试日期</td><td>${curDate}</td></tr>
+        <tr><td>测试日期</td><td>${curDateTime}</td></tr>
         <tr><td>执行时间</td><td>${currentBuild.durationString}</td></tr>
         <tr><td>测试状态</td><td>${testStatus}</td></tr>
     </table>

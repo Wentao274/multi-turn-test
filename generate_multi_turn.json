@@ -1,6 +1,6 @@
 {
     "filetype": "generate_conversations",
-    "num_conversations": 24,
+    "num_conversations": 300,
     "text_files": ["pg1184.txt"],
     "print_stats": false,
     "prompt_input": {

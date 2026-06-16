@@ -121,6 +121,15 @@ ENDSSH
 ssh -o StrictHostKeyChecking=no ${REMOTE_USER}@${REMOTE_HOST} << 'ENDSSH'
 echo "=== 执行多轮对话测试 ==="
 PYTHON_CMD=\$(docker exec ${containerName} bash -c "command -v python3 || command -v python || echo 'python3'")
+
+echo "=== 检查 API 连通性 ==="
+HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" ${params.BASE_URL}/v1/models)
+if [ "\${HTTP_CODE}" != "200" ]; then
+    echo "ERROR: API 连通性检查失败, HTTP状态码: \${HTTP_CODE}, URL: ${params.BASE_URL}/v1/models"
+    exit 1
+fi
+echo "API 连通性检查通过, HTTP状态码: \${HTTP_CODE}"
+
 docker exec ${containerName} bash -c \\
     "cd /workspace/multi-turn-test && \\
     \${PYTHON_CMD} benchmark_serving_multi_turn.py \\
@@ -131,7 +140,6 @@ docker exec ${containerName} bash -c \\
         --output-file ${outputFile} \\
         --num-clients ${params.NUM_CLIENTS} \\
         --max-active-conversations ${params.MAX_ACTIVE_CONVERSATIONS} \\
-        --warmup-step \\
         --trust-remote-code" 2>&1 | tee ${logFile}
 echo "=== 测试执行完成 ==="
 echo "输出文件: ${outputFile}"

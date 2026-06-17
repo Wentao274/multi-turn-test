@@ -156,7 +156,11 @@ docker exec ${containerName} bash -c \\
         ${params.STREAM_MODE == 'false' ? '--no-stream' : ''} \\
         --warmup-step \\
         --no-early-stop \\
-        --trust-remote-code" 2>&1 | tee ${logFile}
+        --trust-remote-code" 2>&1 | tee /tmp/test_${BUILD_NUMBER}.log
+# Best-effort archive to DingoFS (do not fail pipeline if DingoFS write fails)
+cp /tmp/test_${BUILD_NUMBER}.log ${logFile} 2>/dev/null \
+    && echo "日志已归档: ${logFile}" \
+    || echo "WARN: DingoFS 归档失败,日志保留在远程主机 /tmp/test_${BUILD_NUMBER}.log"
 echo "=== 测试执行完成 ==="
 echo "输出文件: ${outputFile}"
 echo "统计文件: ${statsFile}"
@@ -187,6 +191,14 @@ mkdir -p builds
 
 scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r ${REMOTE_USER}@${REMOTE_HOST}:${env.REPORTS_DIR}/${params.TESTER}/${BUILD_NUMBER}/ ./builds/
 
+# Backup: also pull the locally-stored log from remote /tmp (in case DingoFS write failed)
+mkdir -p ./${buildsDir}
+scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    ${REMOTE_USER}@${REMOTE_HOST}:/tmp/test_${BUILD_NUMBER}.log \
+    ./${buildsDir}/test_${BUILD_NUMBER}.log 2>/dev/null \
+    && echo "本地日志备份已拉取" \
+    || echo "WARN: 本地日志备份拉取失败"
+
 echo "=== 拉取完成，查看目录结构 ==="
 find ./${buildsDir} -type f | head -50
 echo "=== 统计文件数量 ==="
@@ -207,15 +219,27 @@ find ./${buildsDir} -name '*.log' | wc -l
                         def buildsDir = "builds/${BUILD_NUMBER}"
                         def curDateTime = env.CUR_DATE_TIME
                         def testStatus = "成功"
-                        
-                        def logFiles = findFiles(glob: "${buildsDir}/**/*.log")
-                        
+
+                        // Prefer the local-backup log file (always complete).
+                        // Fall back to any other .log under buildsDir if the backup is missing.
+                        def preferredLogPath = "./${buildsDir}/test_${BUILD_NUMBER}.log".toString()
+                        def logFiles = []
+                        if (fileExists(preferredLogPath)) {
+                            logFiles = [preferredLogPath]
+                            println("DEBUG: 使用本地备份日志: ${preferredLogPath}")
+                        } else {
+                            logFiles = findFiles(glob: "${buildsDir}/**/*.log")
+                            println("DEBUG: 本地备份日志不存在,回退到 findFiles (找到 ${logFiles ? logFiles.size() : 0} 个)")
+                        }
+
                         def parametersSection = ""
                         def statisticsSummary = ""
-                        
-                        if (logFiles && logFiles.length > 0) {
-                            def logContent = readFile(logFiles[0].path)
-                            def cleanContent = logContent.replaceAll(/\x1b\[[0-9;]*m/, '')
+
+                        if (logFiles && logFiles.size() > 0) {
+                            def logContent = readFile(logFiles[0].toString())
+                            // Strip ALL ANSI/CSI escape sequences, not just SGR (color) codes.
+                            // Matches: ESC [ <params> <intermediate> <final byte>
+                            def cleanContent = logContent.replaceAll(/\x1b\[[0-9;?]*[a-zA-Z]/, '')
                             def lines = cleanContent.split('\n')
                             def inParameters = false
                             def inSummary = false
@@ -225,8 +249,11 @@ find ./${buildsDir} -name '*.log' | wc -l
                             def summaryStarted = false
                             def paramHeaderFound = false
                             
-                            println("DEBUG: 日志文件行数: \${lines.length}")
-                            println("DEBUG: 清理后前5行: \${lines.take(5).join('\n')}")
+                            println("DEBUG: 日志文件行数: " + lines.size())
+                            if (lines.size() > 0) {
+                                println("DEBUG: 第1行: " + lines[0])
+                                println("DEBUG: 最后1行: " + lines[lines.size() - 1])
+                            }
                             
                             for (def line : lines) {
                                 if (line.contains("Parameters:")) {
@@ -241,29 +268,61 @@ find ./${buildsDir} -name '*.log' | wc -l
                                     summaryLines.add(line)
                                 } else if (inParameters && paramHeaderFound) {
                                     if (line.trim().startsWith("---") && parametersLines.size() > 1) {
-                                        break
+                                        // End of Parameters section: just flip the flag,
+                                        // do NOT break out of the whole loop
+                                        // (Statistics summary comes later in the log).
+                                        inParameters = false
+                                    } else {
+                                        parametersLines.add(line)
                                     }
-                                    parametersLines.add(line)
                                 } else if (inSummary && summaryStarted) {
-                                    if (line.trim().startsWith("ttft_ms") || 
-                                        line.trim().startsWith("tpot_ms") ||
-                                        line.trim().startsWith("latency_ms") ||
-                                        line.trim().startsWith("input_num_turns") ||
-                                        line.trim().startsWith("input_num_tokens") ||
-                                        line.trim().startsWith("output_num_tokens") ||
-                                        line.trim().startsWith("output_num_chunks")) {
+                                    // Capture everything inside the Statistics summary block,
+                                    // from the header line up to (and including) "[7 rows x ...]"
+                                    if (line.trim().startsWith("[7 rows x")) {
+                                        summaryLines.add(line)
+                                        inSummary = false
+                                        summaryStarted = false
+                                    } else {
+                                        // Includes: key=value lines (runtime_sec = ...),
+                                        // the "----" separator, table header (count/mean/...),
+                                        // and data rows (ttft_ms, tpot_ms, ...)
                                         summaryLines.add(line)
                                     }
                                 }
                             }
                             
-                            println("DEBUG: 解析到的Parameters行数: \${parametersLines.size()}")
-                            println("DEBUG: 解析到的Statistics行数: \${summaryLines.size()}")
+                            println("DEBUG: 解析到的Parameters行数: " + parametersLines.size())
+                            println("DEBUG: 解析到的Statistics行数: " + summaryLines.size())
                             
                             parametersSection = parametersLines.join('\n')
                             statisticsSummary = summaryLines.join('\n')
                         }
-                        
+
+                        // Fallback: if log-based parsing produced no stats,
+                        // try to reconstruct a basic summary from output.json / stats.json
+                        if ((!statisticsSummary || statisticsSummary.trim().isEmpty()) ||
+                            (!parametersSection || parametersSection.trim().isEmpty())) {
+                            println("DEBUG: 日志解析不完整,尝试从 output.json / stats.json 兜底")
+                            def outputFiles = findFiles(glob: "${buildsDir}/**/output.json")
+                            if (outputFiles && outputFiles.size() > 0) {
+                                try {
+                                    def outJson = readFile(outputFiles[0].path)
+                                    def outObj = readJSON text: outJson
+                                    if (outObj && outObj.size() > 0) {
+                                        def completedConvs = outObj.size()
+                                        if (!parametersSection || parametersSection.trim().isEmpty()) {
+                                            parametersSection = "完成对话数: ${completedConvs} (来源: output.json)"
+                                        }
+                                        if (!statisticsSummary || statisticsSummary.trim().isEmpty()) {
+                                            statisticsSummary = "完成对话数: ${completedConvs}\n(完整统计需查看日志文件)"
+                                        }
+                                    }
+                                } catch (e) {
+                                    println("DEBUG: output.json 兜底解析失败: ${e}")
+                                }
+                            }
+                        }
+
                         if (!statisticsSummary || statisticsSummary.trim().isEmpty()) {
                             statisticsSummary = "无统计数据"
                             testStatus = "失败/无结果"
@@ -332,10 +391,10 @@ find ./${buildsDir} -name '*.log' | wc -l
 </html>"""
 
                         println("=== 发送邮件 ===")
-                        println("日志文件: ${logFiles ? logFiles.length : 0}")
+                        println("日志文件: ${logFiles ? logFiles.size() : 0}")
                         println("测试状态: ${testStatus}")
 
-                        def attachmentPattern = "builds/${BUILD_NUMBER}/**/*.log"
+                        def attachmentPattern = "builds/${BUILD_NUMBER}/test_${BUILD_NUMBER}.log"
                         
                         emailext(
                             subject: "[模型推理 - Multi-Turn 测试报告] #${BUILD_NUMBER} ${params.CHIP} - ${params.MODEL}",

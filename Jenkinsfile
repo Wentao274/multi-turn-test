@@ -3,13 +3,13 @@ pipeline {
     parameters {
         string(name: 'TESTER', defaultValue: 'liwt', description: '测试人员名称')
         string(name: 'CHIP', defaultValue: 'nvidia-h100', description: '芯片平台名称')
-        choice(name: 'INFRA', choices: ['vllm', 'sglang'], description: '推理框架')
+        choice(name: 'INFRA', choices: ['vllm', 'sglang'], description: '推理框架，由于多轮对话是vllm内置的测试脚本，目前仅支持vllm')
         choice(name: 'PD', choices: ['agg', 'disagg'], description: 'PD分离模式,agg 表示非 PD 分离, disagg 表示 PD 分离')
         string(name: 'MODEL', defaultValue: 'kimi-k2.5', description: '模型名称（served-model-name）')
         string(name: 'MODEL_PATH', defaultValue: '/dingofs/data1/userdata/llms/moonshotai/Kimi-K2.6', description: '模型文件本地路径')
-        string(name: 'BASE_URL', defaultValue: 'http://10.201.149.10:8080', description: 'API 地址')
+        string(name: 'BASE_URL', defaultValue: 'http://10.201.149.10:8080', description: 'API 地址，注意不带/v1后缀')
         string(name: 'NUM_CLIENTS', defaultValue: '10', description: '并发客户端数量')
-        string(name: 'MAX_ACTIVE_CONVERSATIONS', defaultValue: '30', description: '最大活跃对话数')
+        string(name: 'MAX_ACTIVE_CONVERSATIONS', defaultValue: '30', description: '最大活跃对话数（每个client的活跃对话槽位数）')
         string(name: 'INPUT_FILE', defaultValue: 'generate_multi_turn.json', description: '输入配置文件名')
         choice(name: 'STREAM_MODE', choices: ['true', 'false'], description: '是否使用流式模式，sglang建议选false')
         text(name: 'RECIPIENTS', defaultValue: 'liwt@zetyun.com', description: '邮件接收者（逗号分隔）')
@@ -59,12 +59,26 @@ ENDSSH
         stage('启动容器并运行测试') {
             steps {
                 script {
-                    def containerName = "multi-turn-test-${params.CHIP}-${params.MODEL}-${BUILD_NUMBER}"
+                    // Sanitize MODEL: if it contains path separators (e.g. "/foo/bar/baz"),
+                    // take only the last segment so it is safe to use in container names,
+                    // report directories, etc. The original value is still kept in params.MODEL
+                    // and used for API calls (curl, --served-model-name) where the server
+                    // expects the full original name.
+                    def MODEL_NAME = (params.MODEL ?: 'unknown').toString().tokenize('/')[-1]
+                    if (!MODEL_NAME) {
+                        MODEL_NAME = 'unknown'
+                    }
+                    env.MODEL_NAME = MODEL_NAME
+
+                    def containerName = "multi-turn-test-${params.CHIP}-${MODEL_NAME}-${BUILD_NUMBER}"
                     def curDateTime = new Date().format('yyyyMMddHHmmss')
-                    def reportsDir = "${env.REPORTS_DIR}/${params.TESTER}/${BUILD_NUMBER}/${params.CHIP}/${params.MODEL}/${curDateTime}"
+                    def reportsDir = "${env.REPORTS_DIR}/${params.TESTER}/${BUILD_NUMBER}/${params.CHIP}/${MODEL_NAME}/${curDateTime}"
                     env.CONTAINER_NAME = containerName
                     env.CUR_DATE_TIME = curDateTime
                     env.REPORTS_DIR_PATH = reportsDir
+
+                    println("=== 原始 MODEL 参数: ${params.MODEL} ===")
+                    println("=== 处理后 MODEL_NAME: ${MODEL_NAME} ===")
 
                     println("=== 启动 vLLM 容器 ===")
                     println("镜像: ${env.VLLM_IMAGE}")
@@ -397,7 +411,7 @@ find ./${buildsDir} -name '*.log' | wc -l
                         def attachmentPattern = "builds/${BUILD_NUMBER}/test_${BUILD_NUMBER}.log"
                         
                         emailext(
-                            subject: "[模型推理 - Multi-Turn 测试报告] #${BUILD_NUMBER} ${params.CHIP} - ${params.MODEL}",
+                            subject: "[模型推理 - Multi-Turn 测试报告] #${BUILD_NUMBER} ${params.CHIP} - ${env.MODEL_NAME ?: params.MODEL}",
                             body: emailBody,
                             to: "${params.RECIPIENTS}",
                             mimeType: 'text/html',
@@ -412,7 +426,7 @@ find ./${buildsDir} -name '*.log' | wc -l
             steps {
                 sshagent(credentials: ["${SSH_CREDENTIALS}"]) {
                     script {
-                        def containerName = env.CONTAINER_NAME ?: "multi-turn-test-${params.CHIP}-${params.MODEL}-${BUILD_NUMBER}"
+                        def containerName = env.CONTAINER_NAME ?: "multi-turn-test-${params.CHIP}-${env.MODEL_NAME ?: params.MODEL.tokenize('/')[-1]}-${BUILD_NUMBER}"
                         println("=== 清理容器: ${containerName} ===")
 
                         sh """

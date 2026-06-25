@@ -56,6 +56,40 @@ ENDSSH
             }
         }
 
+        stage('API 连通性预检') {
+            steps {
+                sshagent(credentials: ["${SSH_CREDENTIALS}"]) {
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        sh """
+ssh -o StrictHostKeyChecking=no ${REMOTE_USER}@${REMOTE_HOST} << 'ENDSSH'
+{
+    echo "=== 检查 API 连通性 (/v1/models) ==="
+    HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" ${params.BASE_URL}/v1/models)
+    if [ "\${HTTP_CODE}" != "200" ]; then
+        echo "ERROR: API 连通性检查失败, HTTP状态码: \${HTTP_CODE}, URL: ${params.BASE_URL}/v1/models"
+        exit 1
+    fi
+    echo "API /v1/models 连通性检查通过, HTTP状态码: \${HTTP_CODE}"
+
+    echo "=== 检查 Chat Completions 接口 ==="
+    CHAT_RESP=\$(curl -s -w "\\n%{http_code}" ${params.BASE_URL}/v1/chat/completions \\
+        -H "Content-Type: application/json" \\
+        -d '{"model":"${params.MODEL}","messages":[{"role":"user","content":"hello"}],"max_tokens":10}')
+    CHAT_HTTP_CODE=\$(echo "\${CHAT_RESP}" | tail -1)
+    if [ "\${CHAT_HTTP_CODE}" != "200" ]; then
+        echo "ERROR: Chat Completions 接口检查失败, HTTP状态码: \${CHAT_HTTP_CODE}"
+        echo "响应内容: \$(echo "\${CHAT_RESP}" | head -n -1)"
+        exit 1
+    fi
+    echo "Chat Completions 接口检查通过, HTTP状态码: \${CHAT_HTTP_CODE}"
+} 2>&1 | tee /tmp/test_${BUILD_NUMBER}.log
+ENDSSH
+"""
+                    }
+                }
+            }
+        }
+
         stage('启动容器并运行测试') {
             steps {
                 script {
@@ -136,26 +170,6 @@ ENDSSH
 ssh -o StrictHostKeyChecking=no ${REMOTE_USER}@${REMOTE_HOST} << 'ENDSSH'
 echo "=== 执行多轮对话测试 ==="
 PYTHON_CMD=\$(docker exec ${containerName} bash -c "command -v python3 || command -v python || echo 'python3'")
-
-echo "=== 检查 API 连通性 ==="
-HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" ${params.BASE_URL}/v1/models)
-if [ "\${HTTP_CODE}" != "200" ]; then
-    echo "ERROR: API 连通性检查失败, HTTP状态码: \${HTTP_CODE}, URL: ${params.BASE_URL}/v1/models"
-    exit 1
-fi
-echo "API /v1/models 连通性检查通过, HTTP状态码: \${HTTP_CODE}"
-
-echo "=== 检查 Chat Completions 接口 ==="
-CHAT_RESP=\$(curl -s -w "\\n%{http_code}" ${params.BASE_URL}/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d '{"model":"${params.MODEL}","messages":[{"role":"user","content":"hello"}],"max_tokens":10}')
-CHAT_HTTP_CODE=\$(echo "\${CHAT_RESP}" | tail -1)
-if [ "\${CHAT_HTTP_CODE}" != "200" ]; then
-    echo "ERROR: Chat Completions 接口检查失败, HTTP状态码: \${CHAT_HTTP_CODE}"
-    echo "响应内容: \$(echo "\${CHAT_RESP}" | head -n -1)"
-    exit 1
-fi
-echo "Chat Completions 接口检查通过, HTTP状态码: \${CHAT_HTTP_CODE}"
 
 docker exec ${containerName} bash -c \\
     "cd /workspace/multi-turn-test && \\

@@ -248,9 +248,16 @@ find ./${buildsDir} -name '*.log' | wc -l
 
                         def parametersSection = ""
                         def statisticsSummary = ""
+                        def failureReason = ""
 
                         if (logFiles && logFiles.size() > 0) {
                             def logContent = readFile(logFiles[0].toString())
+                            // Detect connectivity check failure (API /v1/models or Chat Completions)
+                            if (logContent.contains("API 连通性检查失败") ||
+                                logContent.contains("Chat Completions 接口检查失败")) {
+                                failureReason = "连通性检查未通过"
+                                println("DEBUG: 识别到连通性检查失败, 失败原因: ${failureReason}")
+                            }
                             // Strip ALL ANSI/CSI escape sequences, not just SGR (color) codes.
                             // Matches: ESC [ <params> <intermediate> <final byte>
                             def cleanContent = logContent.replaceAll(/\x1b\[[0-9;?]*[a-zA-Z]/, '')
@@ -386,6 +393,7 @@ find ./${buildsDir} -name '*.log' | wc -l
         <tr><td>测试日期</td><td>${curDateTime}</td></tr>
         <tr><td>执行时间</td><td>${currentBuild.durationString}</td></tr>
         <tr><td>测试状态</td><td>${testStatus}</td></tr>
+        ${failureReason ? "<tr><td>测试失败原因</td><td>${failureReason}</td></tr>" : ""}
     </table>
 
     <h3>Parameters</h3>

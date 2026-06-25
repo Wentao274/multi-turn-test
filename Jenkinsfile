@@ -59,12 +59,14 @@ ENDSSH
         stage('API 连通性预检') {
             steps {
                 sshagent(credentials: ["${SSH_CREDENTIALS}"]) {
-                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                        sh """
+                    script {
+                        try {
+                            sh """
 ssh -o StrictHostKeyChecking=no ${REMOTE_USER}@${REMOTE_HOST} << 'ENDSSH'
+set -o pipefail
 {
     echo "=== 检查 API 连通性 (/v1/models) ==="
-    HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" ${params.BASE_URL}/v1/models)
+    HTTP_CODE=\$(curl -s --connect-timeout 10 -m 30 -o /dev/null -w "%{http_code}" ${params.BASE_URL}/v1/models)
     if [ "\${HTTP_CODE}" != "200" ]; then
         echo "ERROR: API 连通性检查失败, HTTP状态码: \${HTTP_CODE}, URL: ${params.BASE_URL}/v1/models"
         exit 1
@@ -72,7 +74,7 @@ ssh -o StrictHostKeyChecking=no ${REMOTE_USER}@${REMOTE_HOST} << 'ENDSSH'
     echo "API /v1/models 连通性检查通过, HTTP状态码: \${HTTP_CODE}"
 
     echo "=== 检查 Chat Completions 接口 ==="
-    CHAT_RESP=\$(curl -s -w "\\n%{http_code}" ${params.BASE_URL}/v1/chat/completions \\
+    CHAT_RESP=\$(curl -s --connect-timeout 10 -m 60 -w "\\n%{http_code}" ${params.BASE_URL}/v1/chat/completions \\
         -H "Content-Type: application/json" \\
         -d '{"model":"${params.MODEL}","messages":[{"role":"user","content":"hello"}],"max_tokens":10}')
     CHAT_HTTP_CODE=\$(echo "\${CHAT_RESP}" | tail -1)
@@ -85,12 +87,20 @@ ssh -o StrictHostKeyChecking=no ${REMOTE_USER}@${REMOTE_HOST} << 'ENDSSH'
 } 2>&1 | tee /tmp/test_${BUILD_NUMBER}.log
 ENDSSH
 """
+                        } catch (Exception e) {
+                            env.CONNECTIVITY_FAILED = 'true'
+                            currentBuild.result = 'UNSTABLE'
+                            println("=== API 连通性预检失败,后续阶段(启动容器)将跳过 ===")
+                        }
                     }
                 }
             }
         }
 
         stage('启动容器并运行测试') {
+            when {
+                expression { env.CONNECTIVITY_FAILED != 'true' }
+            }
             steps {
                 script {
                     // Sanitize MODEL: if it contains path separators (e.g. "/foo/bar/baz"),
@@ -212,14 +222,15 @@ ENDSSH
                             println("=== 拉取测试结果到 Jenkins workspace ===")
                             
                             sh """
-set -e
 echo "=== 拉取报告目录到 Jenkins workspace ==="
 rm -rf ${buildsDir}
 mkdir -p builds
 
-scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r ${REMOTE_USER}@${REMOTE_HOST}:${env.REPORTS_DIR}/${params.TESTER}/${BUILD_NUMBER}/ ./builds/
+scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r ${REMOTE_USER}@${REMOTE_HOST}:${env.REPORTS_DIR}/${params.TESTER}/${BUILD_NUMBER}/ ./builds/ \
+    && echo "DingoFS 报告目录已拉取" \
+    || echo "WARN: DingoFS 报告目录拉取失败(可能容器未启动)"
 
-# Backup: also pull the locally-stored log from remote /tmp (in case DingoFS write failed)
+# Backup: also pull the locally-stored log from remote /tmp (in case DingoFS write failed or pre-check failed)
 mkdir -p ./${buildsDir}
 scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     ${REMOTE_USER}@${REMOTE_HOST}:/tmp/test_${BUILD_NUMBER}.log \
@@ -263,6 +274,7 @@ find ./${buildsDir} -name '*.log' | wc -l
                         def parametersSection = ""
                         def statisticsSummary = ""
                         def failureReason = ""
+                        def connectivityFailureReason = ""
 
                         if (logFiles && logFiles.size() > 0) {
                             def logContent = readFile(logFiles[0].toString())
@@ -271,6 +283,24 @@ find ./${buildsDir} -name '*.log' | wc -l
                                 logContent.contains("Chat Completions 接口检查失败")) {
                                 failureReason = "连通性检查未通过"
                                 println("DEBUG: 识别到连通性检查失败, 失败原因: ${failureReason}")
+                                // Extract the failure section from log: from section header (=== 检查 ...)
+                                // until the next section starts (=== ...)
+                                def logLines = logContent.split('\n')
+                                def collected = []
+                                def inFailureSection = false
+                                for (def ll : logLines) {
+                                    if (ll.contains("检查 API 连通性") || ll.contains("Chat Completions 接口检查")) {
+                                        inFailureSection = true
+                                    }
+                                    if (inFailureSection) {
+                                        if (!collected.isEmpty() && ll.trim().startsWith("===") &&
+                                            !ll.contains("检查 API 连通性") && !ll.contains("Chat Completions 接口检查")) {
+                                            break
+                                        }
+                                        collected.add(ll)
+                                    }
+                                }
+                                connectivityFailureReason = collected.join('\n').trim()
                             }
                             // Strip ALL ANSI/CSI escape sequences, not just SGR (color) codes.
                             // Matches: ESC [ <params> <intermediate> <final byte>
@@ -368,6 +398,21 @@ find ./${buildsDir} -name '*.log' | wc -l
                             parametersSection = "无参数信息"
                         }
 
+                        // 构建连通性检查失败的提示 HTML（HTML 转义）
+                        def connectivityFailureHtml = ""
+                        if (failureReason) {
+                            def escapedReason = connectivityFailureReason
+                                .replace('&', '&amp;')
+                                .replace('<', '&lt;')
+                                .replace('>', '&gt;')
+                            connectivityFailureHtml = """
+    <div style="background-color: #ffebee; color: #000000; border-left: 4px solid #d32f2f; padding: 12px 15px; margin-top: 15px; border-radius: 3px;">
+        <h3 style="color: #d32f2f; margin-top: 0; margin-bottom: 8px;">⚠️ 连通性检查未通过</h3>
+        <p style="margin-top: 0; margin-bottom: 8px; color: #000000;">本次测试未能正常执行用例，原因是 API 连通性检查失败：</p>
+        <pre style="background-color: #ffffff; color: #000000; padding: 10px; border-radius: 3px; overflow-x: auto; white-space: pre-wrap; margin: 0; font-family: Menlo, Consolas, monospace; font-size: 12px;">${escapedReason}</pre>
+    </div>"""
+                        }
+
                         def emailBody = """
 <html>
 <head>
@@ -407,8 +452,9 @@ find ./${buildsDir} -name '*.log' | wc -l
         <tr><td>测试日期</td><td>${curDateTime}</td></tr>
         <tr><td>执行时间</td><td>${currentBuild.durationString}</td></tr>
         <tr><td>测试状态</td><td>${testStatus}</td></tr>
-        ${failureReason ? "<tr><td>测试失败原因</td><td>${failureReason}</td></tr>" : ""}
     </table>
+
+    ${connectivityFailureHtml}
 
     <h3>Parameters</h3>
     <pre>${parametersSection}</pre>

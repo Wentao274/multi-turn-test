@@ -1,19 +1,19 @@
 pipeline {
     agent any
     parameters {
-        string(name: 'TESTER', defaultValue: 'liwt', description: '测试人员名称')
-        string(name: 'CHIP', defaultValue: 'nvidia-h100', description: '芯片平台名称')
-        choice(name: 'INFRA', choices: ['vllm', 'sglang'], description: '推理框架，由于多轮对话是vllm内置的测试脚本，目前仅支持vllm')
-        choice(name: 'PD', choices: ['agg', 'disagg'], description: 'PD分离模式,agg 表示非 PD 分离, disagg 表示 PD 分离')
-        string(name: 'MODEL', defaultValue: 'kimi-k2.5', description: '模型名称（served-model-name）')
-        string(name: 'MODEL_PATH', defaultValue: '/dingofs/data1/userdata/llms/moonshotai/Kimi-K2.6', description: '模型文件本地路径')
-        string(name: 'BASE_URL', defaultValue: 'http://10.201.149.10:8080', description: 'API 地址，注意不带/v1后缀')
+        string(name: 'TESTER', defaultValue: 'liwt', description: '测试人员名称（必填）')
+        string(name: 'CHIP', defaultValue: 'nvidia-h100', description: '芯片平台名称（必填）')
+        choice(name: 'ENGINE', choices: ['vllm', 'sglang'], description: '推理框架（必填），当前仅支持vllm')
+        choice(name: 'PD', choices: ['agg', 'disagg'], description: 'PD分离模式（agg表示非PD分离，disagg表示PD分离）')
+        string(name: 'MODEL', defaultValue: 'kimi-k2.5', description: '模型服务名称 (必填)')
+        string(name: 'MODEL_PATH', defaultValue: '/dingofs/data1/userdata/llms/moonshotai/Kimi-K2.6', description: '模型文件本地路径，请使用host绝对路径')
+        string(name: 'BASE_URL', defaultValue: 'http://10.201.149.10:8080', description: 'API 地址（必填）')
         string(name: 'NUM_CLIENTS', defaultValue: '10', description: '并发客户端数量')
         string(name: 'MAX_ACTIVE_CONVERSATIONS', defaultValue: '30', description: '最大活跃对话数（每个client的活跃对话槽位数）')
         string(name: 'INPUT_FILE', defaultValue: 'generate_multi_turn.json', description: '输入配置文件名')
         choice(name: 'STREAM_MODE', choices: ['true', 'false'], description: '是否使用流式模式，sglang建议选false')
-        text(name: 'RECIPIENTS', defaultValue: 'liwt@zetyun.com', description: '邮件接收者（逗号分隔）')
-        string(name: 'WORK_DIR', defaultValue: '/dingofs/data1/userdata/liwt/maas-image/multi-turn-test', description: '测试仓库目录，请不要修改')
+        text(name: 'RECIPIENTS', defaultValue: 'liwt@zetyun.com', description: '测试报告邮件接收者（逗号分隔）')
+        string(name: 'WORK_DIR', defaultValue: '/dingofs/data1/userdata/liwt/maas-image/multi-turn-test', description: '测试仓库目录，请不要改动')
     }
     environment {
         SSH_CREDENTIALS = 'HOST_SSH_KEY'
@@ -441,7 +441,7 @@ find ./${buildsDir} -name '*.log' | wc -l
         <tr><td>构建编号</td><td>#${BUILD_NUMBER}</td></tr>
         <tr><td>测试人员</td><td>${params.TESTER}</td></tr>
         <tr><td>芯片平台</td><td>${params.CHIP}</td></tr>
-        <tr><td>推理框架</td><td>${params.INFRA}</td></tr>
+        <tr><td>推理框架</td><td>${params.ENGINE}</td></tr>
         <tr><td>模型名称</td><td>${params.MODEL}</td></tr>
         <tr><td>模型路径</td><td>${params.MODEL_PATH}</td></tr>
         <tr><td>API 地址</td><td>${params.BASE_URL}</td></tr>

@@ -316,8 +316,14 @@ async def send_request(
                     timestamp: int = time.perf_counter_ns()
                     data = json.loads(chunk)
 
+                    # Skip chunks with empty choices (e.g. usage-only or
+                    # finish_reason chunks emitted by some vLLM versions even
+                    # when include_usage=False was requested).
+                    if not data.get("choices"):
+                        continue
+
                     # Delta is the new content/text/data
-                    delta = data["choices"][0]["delta"]
+                    delta = data["choices"][0].get("delta") or {}
                     if delta.get("content", None):
                         if ttft is None:
                             # First token

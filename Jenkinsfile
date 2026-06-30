@@ -24,6 +24,31 @@ pipeline {
     }
 
     stages {
+        stage('打印测试参数') {
+            steps {
+                script {
+                    println("========================================")
+                    println("=== 测试参数信息 ===")
+                    println("========================================")
+                    println("测试人员:        ${params.TESTER}")
+                    println("芯片平台:        ${params.CHIP}")
+                    println("推理框架:        ${params.ENGINE}")
+                    println("PD分离模式:      ${params.PD}")
+                    println("模型服务名称:    ${params.MODEL}")
+                    println("模型路径:        ${params.MODEL_PATH}")
+                    println("BASE_URL:        ${params.BASE_URL}")
+                    println("并发客户端数:    ${params.NUM_CLIENTS}")
+                    println("最大活跃对话数:  ${params.MAX_ACTIVE_CONVERSATIONS}")
+                    println("输入配置文件:    ${params.INPUT_FILE}")
+                    println("流式模式:        ${params.STREAM_MODE}")
+                    println("邮件接收者:      ${params.RECIPIENTS}")
+                    println("工作目录:        ${params.WORK_DIR}")
+                    println("构建编号:        #${BUILD_NUMBER}")
+                    println("========================================")
+                }
+            }
+        }
+
         stage('环境检查') {
             steps {
                 sshagent(credentials: ["${SSH_CREDENTIALS}"]) {
@@ -35,16 +60,6 @@ cd ${params.WORK_DIR}
 echo "=== 工作目录 ==="
 pwd
 ls -la
-echo "=== 测试参数信息 ==="
-echo "测试人员: ${params.TESTER}"
-echo "芯片类型: ${params.CHIP}"
-echo "模型服务名称: ${params.MODEL}"
-echo "模型路径: ${params.MODEL_PATH}"
-echo "BASE_URL: ${params.BASE_URL}"
-echo "并发客户端数: ${params.NUM_CLIENTS}"
-echo "最大活跃对话数: ${params.MAX_ACTIVE_CONVERSATIONS}"
-echo "输入配置文件: ${params.INPUT_FILE}"
-echo "BUILD_NUMBER: ${BUILD_NUMBER}"
 echo "=== Docker 检查 ==="
 docker --version
 echo "=== 检查配置文件 ==="

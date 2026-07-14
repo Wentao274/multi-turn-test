@@ -1,5 +1,7 @@
 pipeline {
-    agent any
+    agent {
+        label 'slave-2'
+    }
     parameters {
         string(name: 'TESTER', defaultValue: 'liwt', description: '测试人员名称（必填）')
         string(name: 'CHIP', defaultValue: 'nvidia-h100', description: '芯片平台名称（必填）')
@@ -12,6 +14,7 @@ pipeline {
         string(name: 'MAX_ACTIVE_CONVERSATIONS', defaultValue: '30', description: '最大活跃对话数（每个client的活跃对话槽位数）')
         string(name: 'INPUT_FILE', defaultValue: 'generate_multi_turn.json', description: '输入配置文件名')
         choice(name: 'STREAM_MODE', choices: ['true', 'false'], description: '是否使用流式模式，sglang建议选false')
+        string(name: 'DESCRIPTION', defaultValue: '', description: '模型服务的描述信息')
         text(name: 'RECIPIENTS', defaultValue: 'liwt@zetyun.com', description: '测试报告邮件接收者（逗号分隔）')
         string(name: 'WORK_DIR', defaultValue: '/dingofs/data2/userdata/liwt/maas-image/multi-turn-test', description: '测试仓库目录，请不要改动')
     }
@@ -41,6 +44,7 @@ pipeline {
                     println("最大活跃对话数:  ${params.MAX_ACTIVE_CONVERSATIONS}")
                     println("输入配置文件:    ${params.INPUT_FILE}")
                     println("流式模式:        ${params.STREAM_MODE}")
+                    println("模型描述:        ${params.DESCRIPTION}")
                     println("邮件接收者:      ${params.RECIPIENTS}")
                     println("工作目录:        ${params.WORK_DIR}")
                     println("构建编号:        #${BUILD_NUMBER}")
@@ -454,6 +458,7 @@ find ./${buildsDir} -name '*.log' | wc -l
     <table>
         <tr><th>项目</th><td>值</td></tr>
         <tr><td>构建编号</td><td>#${BUILD_NUMBER}</td></tr>
+        <tr><td>模型服务描述</td><td>${params.DESCRIPTION}</td></tr>
         <tr><td>测试人员</td><td>${params.TESTER}</td></tr>
         <tr><td>芯片平台</td><td>${params.CHIP}</td></tr>
         <tr><td>推理框架</td><td>${params.ENGINE}</td></tr>
